@@ -127,3 +127,5 @@ print("Plot saved to grokking_curves.png")
 ```
 
 Antigravity wrote run_grokking.py, which trains a small MLP with an embedding layer on the modular addition task $a + b \pmod{97}$. The script uses AdamW with high weight decay (1.0) which is critical for demonstrating grokking. Then, it trained the model, observing the initial phase where training accuracy quickly reached 100% while validation accuracy remained near 0%. Around epoch 1500, the model started its delayed generalization and reached >99% validation accuracy by epoch 2300. Finally, Antigravity created the grokking_curves.png plot showing both training and validation loss/accuracy curves: <img width="1189" height="490" alt="download" src="https://github.com/user-attachments/assets/85504d85-da3f-4431-af93-e422ea49e549" />
+
+# *2. *
