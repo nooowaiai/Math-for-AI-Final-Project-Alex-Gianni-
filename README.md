@@ -126,6 +126,175 @@ plt.savefig('grokking_curves.png', dpi=300)
 print("Plot saved to grokking_curves.png")
 ```
 
-Antigravity wrote run_grokking.py, which trains a small MLP with an embedding layer on the modular addition task $a + b \pmod{97}$. The script uses AdamW with high weight decay (1.0) which is critical for demonstrating grokking. Then, it trained the model, observing the initial phase where training accuracy quickly reached 100% while validation accuracy remained near 0%. Around epoch 1500, the model started its delayed generalization and reached >99% validation accuracy by epoch 2300. Finally, Antigravity created the grokking_curves.png plot showing both training and validation loss/accuracy curves: <img width="1189" height="490" alt="download" src="https://github.com/user-attachments/assets/85504d85-da3f-4431-af93-e422ea49e549" />
+Antigravity created run_grokking.py, which trains a small embedding-based MLP on the modular addition task (a + b) mod 97. The model uses AdamW with strong weight decay, which helps produce the grokking effect. During training, it first memorized the training data: training accuracy quickly reached 100%, while validation accuracy stayed near 0%. Around epoch 1500, validation accuracy began improving sharply, and by about epoch 2300 it exceeded 99%. Finally, the script saved grokking_curves.png, showing the delayed jump in validation performance: <img width="1189" height="490" alt="download" src="https://github.com/user-attachments/assets/85504d85-da3f-4431-af93-e422ea49e549" />
 
-# *2. *
+# *2. Fourier Analysis*
+
+```import torch
+import matplotlib.pyplot as plt
+
+model.eval()
+
+device = next(model.parameters()).device
+p = model.embedding.num_embeddings
+
+print("Device:", device)
+print("Prime p:", p)
+print("Embedding layer:", model.embedding)
+print("MLP:", model.mlp)
+
+E = model.embedding.weight.detach().cpu()   # shape [p, embedding_dim]
+
+print("Embedding matrix shape:", E.shape)
+
+@torch.no_grad()
+def get_hidden_activations_fixed_b(model, b_value=0):
+    """
+    Vary a from 0 to p-1 while fixing b.
+    This creates a 1D signal over a.
+
+    Input is [a, b].
+    Target would be (a + b) mod p.
+    """
+    model.eval()
+
+    a = torch.arange(p, device=device)
+    b = torch.full_like(a, b_value)
+
+    X_line = torch.stack([a, b], dim=1)
+
+    emb = model.embedding(X_line)
+    emb = emb.view(emb.size(0), -1)
+
+    hidden_pre = model.mlp[0](emb)
+    hidden = model.mlp[1](hidden_pre)
+
+    return hidden.detach().cpu()
+
+
+A = get_hidden_activations_fixed_b(model, b_value=0)
+
+print("MLP hidden activation matrix shape:", A.shape)
+
+def fourier_power(X):
+    """
+    X shape: [p, features]
+
+    Applies 1D Fourier transform over the first axis,
+    which corresponds to token/input value 0, 1, ..., p-1.
+    """
+    X = X.detach().cpu().float()
+
+    X = X - X.mean(dim=0, keepdim=True)
+
+    F = torch.fft.rfft(X, dim=0)
+    power = F.real.pow(2) + F.imag.pow(2)
+
+    return power
+
+
+def summarize_spectrum(power, name, top_k=10):
+    """
+    power shape: [num_frequencies, features]
+    """
+    freq_power = power.sum(dim=1)
+    total_power = freq_power.sum() + 1e-12
+
+    top_vals, top_freqs = torch.topk(
+        freq_power,
+        k=min(top_k, len(freq_power))
+    )
+
+    probs = freq_power / total_power
+    entropy = -(probs * torch.log(probs + 1e-12)).sum()
+    normalized_entropy = entropy / torch.log(
+        torch.tensor(len(probs), dtype=torch.float32)
+    )
+
+    print(f"\n=== {name} ===")
+    print("Top frequencies:", top_freqs.tolist())
+    print("Top-10 power fraction:", float(top_vals.sum() / total_power))
+    print("Normalized spectral entropy:", float(normalized_entropy))
+
+    return freq_power, top_freqs, top_vals
+
+embedding_power = fourier_power(E)
+mlp_power = fourier_power(A)
+
+embedding_freq_power, embedding_top_freqs, embedding_top_vals = summarize_spectrum(
+    embedding_power,
+    "Embedding Matrix Fourier Spectrum",
+    top_k=10
+)
+
+mlp_freq_power, mlp_top_freqs, mlp_top_vals = summarize_spectrum(
+    mlp_power,
+    "MLP Hidden Activation Fourier Spectrum",
+    top_k=10
+)
+
+plt.figure(figsize=(8, 4))
+plt.plot(embedding_freq_power.numpy())
+plt.xlabel("Fourier frequency k")
+plt.ylabel("Total spectral power")
+plt.title("Embedding Matrix Fourier Power")
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(8, 4))
+plt.plot(mlp_freq_power.numpy())
+plt.xlabel("Fourier frequency k")
+plt.ylabel("Total spectral power")
+plt.title("MLP Hidden Activation Fourier Power")
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+normalized_mlp_power = mlp_power / (mlp_power.sum(dim=0, keepdim=True) + 1e-12)
+
+vals, freqs = torch.topk(
+    normalized_mlp_power,
+    k=3,
+    dim=0
+)
+
+print("\n=== Individual MLP Neuron Frequency Selectivity ===")
+
+for neuron in range(min(30, normalized_mlp_power.shape[1])):
+    print(
+        f"Neuron {neuron:03d} | "
+        f"top frequencies: {freqs[:, neuron].tolist()} | "
+        f"power fractions: {[round(v, 4) for v in vals[:, neuron].tolist()]}"
+    )
+
+
+plt.figure(figsize=(10, 5))
+plt.imshow(
+    normalized_mlp_power[:, :128].numpy(),
+    aspect="auto",
+    origin="lower"
+)
+plt.xlabel("Neuron index")
+plt.ylabel("Fourier frequency k")
+plt.title("MLP Neuron Fourier Selectivity")
+plt.colorbar(label="Fraction of neuron power")
+plt.tight_layout()
+plt.show()
+```
+Antigravity's Fourier analysis code extracted the learned embedding matrix and the hidden MLP neuron activations from the trained grokking model. It then treated these values as 1D signals over the modular input space and applied a Discrete Fourier Transform to measure which frequencies dominated. The results showed that most spectral power was concentrated in a small number of Fourier frequencies rather than spread evenly across all frequencies. Individual hidden neurons also showed frequency selectivity, meaning many neurons mainly responded to only a few key frequencies. This demonstrates that after grokking, the model did not just memorize examples, it learned a sparse Fourier-like representation of modular addition: <img width="789" height="390" alt="image" src="https://github.com/user-attachments/assets/f9f366cf-ada6-44b1-80ca-f8676b5ea7f5" /> <img width="789" height="390" alt="image" src="https://github.com/user-attachments/assets/4934d0a7-8a32-489b-96a0-558c9aa83783" /> <img width="923" height="490" alt="image" src="https://github.com/user-attachments/assets/6ce616f7-d04d-471b-8a3b-fe6be5da1084" />
+
+# *3. Memorization, Circuit Formation & Analysis*
+
+```
+```
+
+# *4. Epochs Until Generalization*
+
+```
+```
+
+# *6. Algorithm Teasing Small Transformer*
+
+```
+```
