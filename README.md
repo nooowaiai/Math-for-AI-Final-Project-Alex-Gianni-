@@ -291,8 +291,243 @@ Antigravity's Fourier analysis code extracted the learned embedding matrix and t
 
 # *4. Epochs Until Generalization*
 
+```import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import numpy as np
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+p = 97
+fractions = [0.10, 0.30, 0.60, 0.90]
+max_epochs = 15000
+check_every = 100
+threshold = 0.99
+
+X = []
+y = []
+
+for a in range(p):
+    for b in range(p):
+        X.append([a, b])
+        y.append((a + b) % p)
+
+X = torch.tensor(X, dtype=torch.long)
+y = torch.tensor(y, dtype=torch.long)
+
+class GrokkingMLP(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embedding_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, vocab_size)
+        )
+
+    def forward(self, x):
+        emb = self.embedding(x)
+        emb = emb.view(emb.size(0), -1)
+        return self.mlp(emb)
+
+def train_one_fraction(fraction_train):
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    indices = torch.randperm(len(X))
+    split_idx = int(fraction_train * len(X))
+
+    train_idx = indices[:split_idx]
+    test_idx = indices[split_idx:]
+
+    X_train = X[train_idx].to(device)
+    y_train = y[train_idx].to(device)
+    X_test = X[test_idx].to(device)
+    y_test = y[test_idx].to(device)
+
+    model = GrokkingMLP(
+        vocab_size=p,
+        embedding_dim=128,
+        hidden_dim=256
+    ).to(device)
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=1e-3,
+        weight_decay=1.0
+    )
+
+    criterion = nn.CrossEntropyLoss()
+
+    train_accs = []
+    test_accs = []
+    epochs = []
+
+    memorization_epoch = None
+    generalization_epoch = None
+
+    print()
+    print("Training fraction:", fraction_train)
+
+    for epoch in range(max_epochs + 1):
+        model.train()
+
+        optimizer.zero_grad()
+        logits = model(X_train)
+        loss = criterion(logits, y_train)
+        loss.backward()
+        optimizer.step()
+
+        if epoch % check_every == 0:
+            model.eval()
+
+            with torch.no_grad():
+                train_logits = model(X_train)
+                test_logits = model(X_test)
+
+                train_acc = (train_logits.argmax(dim=1) == y_train).float().mean().item()
+                test_acc = (test_logits.argmax(dim=1) == y_test).float().mean().item()
+
+            train_accs.append(train_acc)
+            test_accs.append(test_acc)
+            epochs.append(epoch)
+
+            print(
+                "Epoch",
+                epoch,
+                "| Train Acc:",
+                round(train_acc, 4),
+                "| Test Acc:",
+                round(test_acc, 4)
+            )
+
+            if memorization_epoch is None and train_acc >= threshold:
+                memorization_epoch = epoch
+
+            if generalization_epoch is None and test_acc >= threshold:
+                generalization_epoch = epoch
+                break
+
+    if memorization_epoch is None:
+        grokking_delay = None
+    elif generalization_epoch is None:
+        grokking_delay = None
+    else:
+        grokking_delay = generalization_epoch - memorization_epoch
+
+    return {
+        "fraction": fraction_train,
+        "epochs": epochs,
+        "train_accs": train_accs,
+        "test_accs": test_accs,
+        "memorization_epoch": memorization_epoch,
+        "generalization_epoch": generalization_epoch,
+        "grokking_delay": grokking_delay
+    }
+
+results = []
+
+for fraction in fractions:
+    results.append(train_one_fraction(fraction))
+
+print()
+print("Summary")
+
+for r in results:
+    print(
+        "Fraction:",
+        r["fraction"],
+        "| Memorization epoch:",
+        r["memorization_epoch"],
+        "| Generalization epoch:",
+        r["generalization_epoch"],
+        "| Grokking delay:",
+        r["grokking_delay"]
+    )
+
+x = [100 * r["fraction"] for r in results]
+
+y_generalization = [
+    r["generalization_epoch"] if r["generalization_epoch"] is not None else max_epochs
+    for r in results
+]
+
+labels_generalization = [
+    str(r["generalization_epoch"]) if r["generalization_epoch"] is not None else "not reached"
+    for r in results
+]
+
+plt.figure(figsize=(8, 5))
+plt.plot(x, y_generalization, marker="o")
+plt.xlabel("Training Data Fraction")
+plt.ylabel("Epochs until Generalization")
+plt.title("Training Fraction vs Epochs until Generalization")
+plt.grid(True, alpha=0.3)
+
+for xi, yi, label in zip(x, y_generalization, labels_generalization):
+    plt.text(xi, yi, label, ha="center", va="bottom")
+
+plt.tight_layout()
+plt.savefig("epochs_until_generalization.png", dpi=300)
+plt.show()
+
+plt.figure(figsize=(9, 5))
+
+for r in results:
+    plt.plot(
+        r["epochs"],
+        r["test_accs"],
+        label=str(int(100 * r["fraction"])) + " percent train"
+    )
+
+plt.axhline(threshold, linestyle="--", label="generalization threshold")
+plt.xlabel("Epoch")
+plt.ylabel("Test Accuracy")
+plt.title("Test Accuracy Across Training Data Fractions")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("test_accuracy_by_fraction.png", dpi=300)
+plt.show()
+
+delay_values = [
+    r["grokking_delay"] if r["grokking_delay"] is not None else 0
+    for r in results
+]
+
+delay_labels = [
+    str(r["grokking_delay"]) if r["grokking_delay"] is not None else "no grokking"
+    for r in results
+]
+
+plt.figure(figsize=(8, 5))
+plt.bar(x, delay_values, width=10)
+plt.xlabel("Training Data Fraction")
+plt.ylabel("Generalization Epoch minus Memorization Epoch")
+plt.title("Grokking Delay by Training Data Fraction")
+plt.grid(True, axis="y", alpha=0.3)
+
+for xi, yi, label in zip(x, delay_values, delay_labels):
+    plt.text(xi, yi, label, ha="center", va="bottom")
+
+plt.tight_layout()
+plt.savefig("grokking_delay_by_fraction.png", dpi=300)
+plt.show()
+
+print()
+print("Saved epochs_until_generalization.png")
+print("Saved test_accuracy_by_fraction.png")
+print("Saved grokking_delay_by_fraction.png")
 ```
-```
+
+Antigravity's code varied the amount of training data used for the modular addition task ((a + b) \bmod 97), using 10%, 30%, 60%, and 90% of the full dataset. For each fraction, it trained the same embedding-based MLP with AdamW and strong weight decay, then recorded when the model reached 99% validation accuracy. The first graph shows that with only 10% training data, the model never generalized within 15,000 epochs. With 30% training data, it eventually generalized, but only after a very long delay around epoch 10,900. With 60% and 90% training data, generalization happened much faster, around epochs 1,600 and 700. The second graph shows the validation accuracy curves directly: 30% has the clearest grokking pattern because validation accuracy stays near zero for thousands of epochs before suddenly rising, while 60% and 90% improve much earlier. The third graph measures the grokking delay, meaning the time between memorizing the training set and generalizing to the test set. The delay is largest at 30%, smaller at 60% and 90%, and absent at 10% because the model never generalized. Overall, these plots show that grokking appears most strongly in a specific data-scarce regime: too little data prevents generalization, moderate scarcity creates delayed grokking, and abundant data makes generalization happen quickly: <img width="789" height="490" alt="image" src="https://github.com/user-attachments/assets/fccd1d55-13e7-455a-83ee-985ed56ed15f" /> <img width="889" height="490" alt="image" src="https://github.com/user-attachments/assets/22e75c48-74da-4cca-bdb8-3234ec8ea1e3" /> <img width="790" height="490" alt="image" src="https://github.com/user-attachments/assets/f8b2d2cc-5b01-4d10-b60d-c2db078e42b5" />
+
+
+
 
 # *6. Algorithm Teasing Small Transformer*
 
