@@ -285,7 +285,285 @@ plt.show()
 The learned embedding matrix and MLP activations have Fourier spectra whose power is concentrated on a small number of frequencies. The top-k Fourier modes explain a large fraction of total spectral power, and the normalized spectral entropy is low compared with a randomly initialized control. This indicates that the network has learned to represent the input domain using a sparse set of key frequencies. <img width="789" height="390" alt="image" src="https://github.com/user-attachments/assets/f9f366cf-ada6-44b1-80ca-f8676b5ea7f5" /> <img width="789" height="390" alt="image" src="https://github.com/user-attachments/assets/4934d0a7-8a32-489b-96a0-558c9aa83783" /> <img width="923" height="490" alt="image" src="https://github.com/user-attachments/assets/6ce616f7-d04d-471b-8a3b-fe6be5da1084" />
 
 # *3. Memorization, Circuit Formation & Analysis*
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+import random
 
+
+P = 113
+TRAIN_FRAC = 0.3
+EPOCHS = 4000
+LR = 1e-3
+WEIGHT_DECAY = 1.0
+D_MODEL = 128
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+print("Device:", DEVICE)
+
+
+
+pairs = [(i, j) for i in range(P) for j in range(P)]
+
+random.seed(0)
+random.shuffle(pairs)
+
+split = int(TRAIN_FRAC * len(pairs))
+
+train_pairs = pairs[:split]
+test_pairs = pairs[split:]
+
+def fn(x, y):
+    return (x + y) % P
+
+x_train = torch.tensor(train_pairs, device=DEVICE)
+y_train = torch.tensor([fn(i, j) for i, j in train_pairs], device=DEVICE)
+
+x_test = torch.tensor(test_pairs, device=DEVICE)
+y_test = torch.tensor([fn(i, j) for i, j in test_pairs], device=DEVICE)
+
+all_pairs = torch.tensor(pairs, device=DEVICE)
+all_labels = torch.tensor([fn(i, j) for i, j in pairs], device=DEVICE)
+
+
+class SimpleTransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.embed = nn.Embedding(P + 1, D_MODEL)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=D_MODEL,
+            nhead=4,
+            dim_feedforward=4 * D_MODEL,
+            batch_first=True
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=1
+        )
+
+        self.unembed = nn.Linear(D_MODEL, P)
+
+    def forward(self, x):
+
+        x = self.embed(x)
+
+        x = self.transformer(x)
+
+        x = x[:, -1]
+
+        return self.unembed(x)
+
+model = SimpleTransformer().to(DEVICE)
+
+optimizer = optim.AdamW(
+    model.parameters(),
+    lr=LR,
+    weight_decay=WEIGHT_DECAY
+)
+
+
+basis = []
+
+basis.append(torch.ones(P) / np.sqrt(P))
+
+for k in range(1, P // 2 + 1):
+    basis.append(torch.cos(2 * torch.pi * torch.arange(P) * k / P))
+    basis.append(torch.sin(2 * torch.pi * torch.arange(P) * k / P))
+
+basis = torch.stack(basis).to(DEVICE)
+
+def fft2d(values):
+
+    values = values.reshape(P, P, -1)
+
+    return torch.einsum(
+        'xyc,fx,gy->fgc',
+        values,
+        basis,
+        basis
+    )
+
+
+
+@torch.no_grad()
+def get_key_freqs():
+
+    logits = model(all_pairs)
+
+    fourier = fft2d(logits)
+
+    power = fourier.pow(2).sum(-1)
+
+    power[0, 0] = 0
+
+    flat = power.flatten()
+
+    topk = torch.topk(flat, 6)
+
+    freqs = []
+
+    for idx in topk.indices:
+
+        x = idx // power.shape[1]
+        y = idx % power.shape[1]
+
+        freqs.append((x.item(), y.item()))
+
+    return freqs
+
+
+@torch.no_grad()
+def compute_losses():
+
+    logits = model(all_pairs)
+
+    total_loss = F.cross_entropy(logits, all_labels)
+
+  
+    fourier = fft2d(logits)
+
+    key_freqs = get_key_freqs()
+
+    restricted_fourier = torch.zeros_like(fourier)
+
+    for fx, fy in key_freqs:
+        restricted_fourier[fx, fy] = fourier[fx, fy]
+
+    excluded_fourier = fourier - restricted_fourier
+
+    
+    restricted_logits = torch.einsum(
+        'fgc,fx,gy->xyc',
+        restricted_fourier,
+        basis,
+        basis
+    ).reshape(P * P, P)
+
+    excluded_logits = torch.einsum(
+        'fgc,fx,gy->xyc',
+        excluded_fourier,
+        basis,
+        basis
+    ).reshape(P * P, P)
+
+    restricted_loss = F.cross_entropy(
+        restricted_logits,
+        all_labels
+    )
+
+    excluded_loss = F.cross_entropy(
+        excluded_logits,
+        all_labels
+    )
+
+    return (
+        total_loss.item(),
+        restricted_loss.item(),
+        excluded_loss.item()
+    )
+
+
+
+train_losses = []
+test_losses = []
+
+restricted_losses = []
+excluded_losses = []
+
+weight_norms = []
+
+for epoch in range(EPOCHS):
+
+    model.train()
+
+    optimizer.zero_grad()
+
+    logits = model(x_train)
+
+    loss = F.cross_entropy(logits, y_train)
+
+    loss.backward()
+
+    optimizer.step()
+
+    
+    if epoch % 100 == 0:
+
+        model.eval()
+
+        with torch.no_grad():
+
+            train_loss = F.cross_entropy(
+                model(x_train),
+                y_train
+            ).item()
+
+            test_loss = F.cross_entropy(
+                model(x_test),
+                y_test
+            ).item()
+
+            _, restricted_loss, excluded_loss = compute_losses()
+
+            weight_norm = sum(
+                p.pow(2).sum().item()
+                for p in model.parameters()
+            )
+
+        train_losses.append(train_loss)
+        test_losses.append(test_loss)
+
+        restricted_losses.append(restricted_loss)
+        excluded_losses.append(excluded_loss)
+
+        weight_norms.append(weight_norm)
+
+        print(
+            f"Epoch {epoch:5d} | "
+            f"Train {train_loss:.4f} | "
+            f"Test {test_loss:.4f}"
+        )
+
+
+
+epochs = np.arange(len(train_losses)) * 100
+
+fig, ax1 = plt.subplots(figsize=(12, 7))
+
+ax1.semilogy(epochs, train_losses, label="Train Loss")
+ax1.semilogy(epochs, test_losses, label="Test Loss")
+ax1.semilogy(epochs, restricted_losses, label="Restricted Loss")
+ax1.semilogy(epochs, excluded_losses, label="Excluded Loss")
+
+ax1.set_xlabel("Epoch")
+ax1.set_ylabel("Loss (log scale)")
+
+ax2 = ax1.twinx()
+
+ax2.plot(
+    epochs,
+    weight_norms,
+    linestyle="--",
+    label="Weight Norm"
+)
+
+ax2.set_ylabel("Sum of Squared Weights")
+
+
+lines1, labels1 = ax1.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+
+ax1.legend(lines1 + lines2, labels1 + labels2)
+
+plt.title("Three Phases of Grokking")
+
+plt.show()
 ```
 ```
 
